@@ -1,0 +1,232 @@
+--- a/src/engine.py
++++ b/src/engine.py
+@@ -204,6 +204,12 @@
+                  "util": [], "iter_ms": []} if record_trace else None
+ 
+         scheduler.reset()
++        # Persist the previous completed iteration's telemetry across State snapshots.
++        # State is recreated on every scheduler tick, so keeping these values only on
++        # the previous State silently disabled feedback controllers such as SLOA EMA.
++        prev_iter_us = 0.0
++        prev_util = 0.0
++        prev_tokens = 0
+         empty_streak = 0
+         while True:
+@@ -233,6 +239,8 @@
+             st = State(now=now, waiting=waiting, prefilling=prefilling, decode=decode,
+                        kv_used=kv_used, kv_cap=self.kv_cap, cfg=cfg,
+                        cost=self.planner, stats=stats,
++                       last_iter_us=prev_iter_us, last_util=prev_util,
++                       last_tokens=prev_tokens,
+                        kv_util=kv_used / max(1, self.kv_cap))
+@@ -370,6 +378,10 @@
+             stats["sum_util"] += util
+             st.last_iter_us = actual
+             st.last_util = util
++            st.last_tokens = br.tokens
++            prev_iter_us = actual
++            prev_util = util
++            prev_tokens = br.tokens
+--- a/src/profile.py
++++ b/src/profile.py
+@@ -187,8 +187,8 @@
+             for c in m["mixed_chunk"]:
+                 for ctx in m["mixed_ctx"]:
+                     _p = self._point("mixed", n, c, ctx, ctx * 0.6)
+-                if _p is not None:
+-                    out.append(_p)
++                    if _p is not None:
++                        out.append(_p)
+--- a/src/workload.py
++++ b/src/workload.py
+@@ -7,8 +7,9 @@
+ * a **whale mixture** on the prompt axis -- 6-18% of requests are 8k-40k tokens while
+   the body sits at a few hundred (a 50-100x length ratio inside one queue);
+ * a **long-output mixture** -- 4-12% of requests generate 2k-8k tokens;
+-* **bursty / stepped arrivals** -- a two-state MMPP with a 12x rate ratio, and a
+-  flash-crowd profile that steps to 25x in 20 s.
++* **bursty / stepped arrivals** -- a two-state MMPP whose configured high/low
++  multipliers have a 41.6x ratio (then normalized to preserve the mean offered rate),
++  and a flash-crowd profile that reaches a 25x raw multiplier.
+@@ -102,7 +103,10 @@
+         self.spec = spec
+         self.slo = slo
+         self.rate = rate
+-        self.rng = np.random.default_rng(seed)
++        # Separate RNG streams keep request marks (prompt/output/SLO) independent of
++        # arrival-process draws. This makes load sweeps reproducible and comparable.
++        self.rng = np.random.default_rng(seed + 104729)
++        self.arrival_rng = np.random.default_rng(seed + 130363)
+@@ -129,20 +133,26 @@
+         s = self.spec
+         dur = s.duration_s
+         if s.arrival == "poisson":
+-            n = self.rng.poisson(self.rate * dur)
+-            t = np.sort(self.rng.uniform(0, dur, n))
++            n = self.arrival_rng.poisson(self.rate * dur)
++            t = np.sort(self.arrival_rng.uniform(0, dur, n))
+             return t
+         if s.arrival == "mmpp":
+             mult = np.empty(0)
+             t = 0.0
+             high = False
++            # Alternating exponential sojourns have stationary time fractions
++            # proportional to their mean dwell times. Normalize multipliers so the
++            # long-run arrival rate equals the configured rate (nominal rho).
++            p_high = s.burst_mean_high_s / max(1e-9, s.burst_mean_high_s + s.burst_mean_low_s)
++            p_low = 1.0 - p_high
++            raw_mean = p_high * s.burst_high_mult + p_low / (s.burst_high_mult ** 0.5)
+             while t < dur:
+                 # exponential sojourn
+-                sojourn = self.rng.exponential(s.burst_mean_high_s if high else s.burst_mean_low_s)
++                sojourn = self.arrival_rng.exponential(s.burst_mean_high_s if high else s.burst_mean_low_s)
+                 sojourn = min(sojourn, dur - t)
+-                lam = self.rate * (s.burst_high_mult if high else 1.0 / s.burst_high_mult ** 0.5)
+-                n = self.rng.poisson(lam * sojourn)
+-                seg = np.sort(self.rng.uniform(t, t + sojourn, n))
++                lam = self.rate * (s.burst_high_mult if high else 1.0 / s.burst_high_mult ** 0.5) / max(raw_mean, 1e-9)
++                n = self.arrival_rng.poisson(lam * sojourn)
++                seg = np.sort(self.arrival_rng.uniform(t, t + sojourn, n))
+@@ -150,12 +160,28 @@
+         if s.arrival == "step":
+             times = []
+             t = 0.0
+-            for dur_seg, m in s.step_profile:
++            used_segments = []
++            remaining = dur
++            for seg_dur, mult in s.step_profile:
++                used = min(seg_dur, max(0.0, remaining))
++                if used > 0:
++                    used_segments.append((used, mult))
++                    remaining -= used
++            # If the simulation horizon exceeds the explicit flash-crowd profile,
++            # continue at the final baseline multiplier instead of silently dropping
++            # arrivals for the tail of the horizon.
++            if remaining > 0 and s.step_profile:
++                used_segments.append((remaining, s.step_profile[-1][1]))
++            mean_mult = (sum(d * mult for d, mult in used_segments) /
++                         max(sum(d for d, _ in used_segments), 1e-9))
++            for dur_seg, m in used_segments:
+                 dur_seg = min(dur_seg, max(0.0, dur - t))
+                 if dur_seg <= 0:
+                     break
+-                n = self.rng.poisson(self.rate * m * dur_seg)
+-                times.append(np.sort(self.rng.uniform(t, t + dur_seg, n)))
++                # Normalize stepped multipliers by the time-weighted mean over the
++                # configured profile, preserving the requested long-run rate.
++                n = self.arrival_rng.poisson(self.rate * (m / max(mean_mult, 1e-9)) * dur_seg)
++                times.append(np.sort(self.arrival_rng.uniform(t, t + dur_seg, n)))
+--- a/src/experiment.py
++++ b/src/experiment.py
+@@ -71,7 +71,10 @@
+-    base, _ = generate(spec, 1.0, SLO_POLICY, seed)
++    # Estimate request-size moments from a long independent trace so the offered
++    # load calibration is not dominated by a few sampled whale requests.
++    base_spec = replace(spec, duration_s=max(spec.duration_s, 10000.0), warmup_s=0.0)
++    base, _ = generate(base_spec, 1.0, SLO_POLICY, seed)
+@@ -103,6 +106,17 @@
+     t0 = time.time()
+     res = eng.run(reqs, spec.duration_s, spec.warmup_s, policy)
+     m = dict(res.metrics)
++    if hasattr(policy, "tilt_log") and policy.tilt_log:
++        tlog = policy.tilt_log
++        m["tilt_ttft_frac"] = sum(x[1] == "TTFT-first" for x in tlog) / len(tlog)
++        m["tilt_tpot_frac"] = sum(x[1] == "TPOT-first" for x in tlog) / len(tlog)
++        m["tilt_balanced_frac"] = sum(x[1] == "balanced" for x in tlog) / len(tlog)
++        m["risk_ttft_mean"] = float(np.mean([x[2] for x in tlog]))
++        m["risk_tpot_mean"] = float(np.mean([x[3] for x in tlog]))
++        m["chunk_target_mean"] = float(np.mean([x[4] for x in tlog]))
++        m["budget_target_mean"] = float(np.mean([x[5] for x in tlog]))
++        m["effective_budget_mean"] = float(np.mean([x[6] for x in tlog]))
++        m["effective_chunk_mean"] = float(np.mean([x[7] for x in tlog]))
+--- a/src/schedulers.py
++++ b/src/schedulers.py
+@@ -380,7 +380,7 @@
+     def __init__(self, alpha: float = 0.55, gamma: float = 0.30,
+                  chunk_min: int = 128, chunk_max: int = 4096,
+-                 budget_min: int = 1024, budget_max: int = 8192,
++                 budget_min: int = 512, budget_max: int = 2048,
+@@ -400,7 +400,7 @@
+         #: controller state
+         self.chunk_target = 512.0
+-        self.budget_target = 4096.0
++        self.budget_target = 1536.0
+@@ -424,23 +424,63 @@
+-    # ---- tilt ----------------------------------------------------------------------
++    # ---- predictive dual-SLO risk --------------------------------------------------
+     def _tilt(self, st: State) -> str:
+-        if st.waiting:
+-            risk_t = sum(1 for r in st.waiting
+-                         if (st.now - r.arrival) / max(1e-3, r.ttft_slo_ms / 1e3)
+-                         > self.risk_threshold) / len(st.waiting)
+-        else:
+-            risk_t = 0.0
+-        if st.decode:
+-            risk_p = sum(1 for r in st.decode
+-                         if r.last_token_t is not None and
+-                         (st.now - r.last_token_t) / max(1e-3, r.tpot_slo_ms / 1e3)
+-                         > self.risk_threshold) / len(st.decode)
+-        else:
+-            risk_p = 0.0
++        """Predict next-boundary TTFT/TPOT budget consumption."""
++        nd = min(len(st.decode), st.cfg.max_num_seqs)
++        ctx_d = sum(r.context_len for r in st.decode[:nd])
++        decode_step_s = (st.cost.decode_only_us(nd, ctx_d) * 1e-6) if nd else 0.0
++        ttft_population = list(st.waiting) + list(st.prefilling)
++        ttft_risky = 0
++        if ttft_population:
++            remaining_mean = sum(max(0, r.prompt_len - r.prefill_done)
++                                 for r in ttft_population) / len(ttft_population)
++            context_mean = sum(max(0, r.prefill_done) for r in ttft_population) / len(ttft_population)
++            next_chunk = min(int(self.chunk_target), int(remaining_mean))
++            ctx_p_ref = float(context_mean)
++            next_s = (st.cost.iteration_us(nd, ctx_d, next_chunk, 1, ctx_p_ref) * 1e-6
++                      if next_chunk > 0 else 0.0)
++            for r in ttft_population:
++                elapsed = st.now - r.arrival
++                budget = max(1e-3, r.ttft_slo_ms / 1e3)
++                if (elapsed + next_s) / budget >= self.risk_threshold:
++                    ttft_risky += 1
++        risk_t = ttft_risky / len(ttft_population) if ttft_population else 0.0
++        tpot_risky = 0
++        for r in st.decode:
++            if r.last_token_t is None:
++                continue
++            elapsed = st.now - r.last_token_t
++            budget = max(1e-3, r.tpot_slo_ms / 1e3)
++            if (elapsed + decode_step_s) / budget >= self.risk_threshold:
++                tpot_risky += 1
++        risk_p = tpot_risky / len(st.decode) if st.decode else 0.0
+         self._last_risk = (risk_t, risk_p)
++        if risk_t == 0.0 and risk_p == 0.0:
++            return "balanced"
+         return "TTFT-first" if risk_t >= risk_p else "TPOT-first"
++
++    def reset(self) -> None:
++        self.chunk_target = 512.0
++        self.budget_target = 1536.0
++        self.util_ema = 0.5
++        self.tilt = "balanced"
++        self.tilt_log.clear()
++        self._cap_cache.clear()
++        self._last_risk = (0.0, 0.0)
+@@ -520,9 +560,6 @@
+         self._update_knobs(st)
+         self.tilt = self._tilt(st)
+         rt, rp = self._last_risk
+-        self.tilt_log.append((st.now, self.tilt, rt, rp, self.chunk_target,
+-                              self.budget_target))
+-
+         plan = Plan()
+@@ -538,7 +575,12 @@
+-        budget = int(min(cfg.max_num_batched_tokens, self.budget_target)) - len(plan.decode)
++        tilt_budget_scale = 1.20 if self.tilt == "TTFT-first" else (0.65 if self.tilt == "TPOT-first" else 1.0)
++        tilt_chunk_scale = 1.25 if self.tilt == "TTFT-first" else (0.60 if self.tilt == "TPOT-first" else 1.0)
++        effective_budget = min(cfg.max_num_batched_tokens, int(self.budget_target * tilt_budget_scale))
++        effective_chunk = max(self.chunk_min, min(self.chunk_max, int(self.chunk_target * tilt_chunk_scale)))
++        self.tilt_log.append((st.now, self.tilt, rt, rp, self.chunk_target, self.budget_target,
++                              effective_budget, effective_chunk))
++        budget = effective_budget - len(plan.decode)
+@@ -558,1 +600,1 @@
+-                r.chunk_quota = int(self.chunk_target)
++                r.chunk_quota = effective_chunk
