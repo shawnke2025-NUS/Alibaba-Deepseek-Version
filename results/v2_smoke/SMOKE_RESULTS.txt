@@ -1,0 +1,16 @@
+V2.0 smoke test (W3-mixed, offered rate 0.35 req/s, seed=1 workload / seed=3 engine, duration=600s)
+
+Predictor fit: k_compute=1.266, k_mem=1.299, eff_flops=40.369 TFLOPs, eff_bw=612.433 GB/s
+KV capacity=109,540 tokens; knee batch=16.1
+
+policy                  goodput_req_s  ttft_p99_ms  tpot_reqp99_p99_ms  slo_attainment  reject_rate  iterations
+FCFS+Full               0.080          23630.572    2251.145            0.307           0.005        8811
+Fixed-256               0.083          31035.711    1127.070            0.317           0.000        9019
+Fixed-1024              0.064          26269.720    2178.771            0.243           0.000        9338
+Fixed-256+SPF            0.083          31035.711    1127.070            0.317           0.000        9019
+SLOWEAVE                0.188          47796.300     614.249            0.733           0.000        8764
+SLAI                    0.081          18924.748    1120.561            0.307           0.005        9799
+RAD(b_col=32,B=16)      0.124          35429.672   12894.281            0.470           0.000        9700
+SLOA                    0.155          44459.636    1281.068            0.599           0.000        8574
+
+Validation scope: compileall + one smoke workload only. Values above are simulator results, not real-GPU measurements. The V2 code path was exercised; these metrics should not be interpreted as a V1-vs-V2 paired benchmark or as evidence of a performance gain.
