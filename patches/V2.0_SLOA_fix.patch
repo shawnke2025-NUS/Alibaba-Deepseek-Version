@@ -1,0 +1,84 @@
+--- a/src/schedulers.py
++++ b/src/schedulers.py
+@@ -424,23 +424,59 @@
+         return (self.w_urgency * urgency + self.w_prefill * prefill_frac
+                 + self.w_decode * decode_frac + self.w_short * short)
+ 
+-    # ---- tilt ----------------------------------------------------------------------
++    # ---- predictive dual-SLO risk --------------------------------------------------
+     def _tilt(self, st: State) -> str:
+-        if st.waiting:
+-            risk_t = sum(1 for r in st.waiting
+-                         if (st.now - r.arrival) / max(1e-3, r.ttft_slo_ms / 1e3)
+-                         > self.risk_threshold) / len(st.waiting)
+-        else:
+-            risk_t = 0.0
+-        if st.decode:
+-            risk_p = sum(1 for r in st.decode
+-                         if r.last_token_t is not None and
+-                         (st.now - r.last_token_t) / max(1e-3, r.tpot_slo_ms / 1e3)
+-                         > self.risk_threshold) / len(st.decode)
+-        else:
+-            risk_p = 0.0
++        """Estimate budget consumption at the *next* scheduling boundary.
++
++        TTFT population includes both queued and already-prefilling requests: starting
++        prefill does not stop the TTFT clock. TPOT risk includes the predicted next
++        decode iteration, rather than only elapsed time since the previous token.
++        Ratios are fractions of each request's own SLO budget.
++        """
++        nd = min(len(st.decode), st.cfg.max_num_seqs)
++        ctx_d = sum(r.context_len for r in st.decode[:nd])
++        decode_step_s = (st.cost.decode_only_us(nd, ctx_d) * 1e-6) if nd else 0.0
++
++        ttft_population = list(st.waiting) + list(st.prefilling)
++        ttft_risky = 0
++        for r in ttft_population:
++            if r in st.waiting:
++                next_chunk = min(r.prompt_len, int(self.chunk_target))
++            else:
++                next_chunk = min(r.prefill_remaining, int(self.chunk_target))
++            next_s = (st.cost.iteration_us(nd, ctx_d, next_chunk, 1,
++                                           float(r.prefill_done)) * 1e-6
++                      if next_chunk > 0 else 0.0)
++            elapsed = st.now - r.arrival
++            budget = max(1e-3, r.ttft_slo_ms / 1e3)
++            if (elapsed + next_s) / budget >= self.risk_threshold:
++                ttft_risky += 1
++        risk_t = ttft_risky / len(ttft_population) if ttft_population else 0.0
++
++        tpot_risky = 0
++        for r in st.decode:
++            if r.last_token_t is None:
++                continue
++            elapsed = st.now - r.last_token_t
++            budget = max(1e-3, r.tpot_slo_ms / 1e3)
++            if (elapsed + decode_step_s) / budget >= self.risk_threshold:
++                tpot_risky += 1
++        risk_p = tpot_risky / len(st.decode) if st.decode else 0.0
++
+         self._last_risk = (risk_t, risk_p)
+         return "TTFT-first" if risk_t >= risk_p else "TPOT-first"
++
++    def reset(self) -> None:
++        """Reset controller state between independent simulation runs."""
++        self.chunk_target = 512.0
++        self.budget_target = 4096.0
++        self.util_ema = 0.5
++        self.tilt = "balanced"
++        self.tilt_log.clear()
++        self._cap_cache.clear()
++        self._last_risk = (0.0, 0.0)
+ 
+@@ -538,7 +574,17 @@
+-        budget = int(min(cfg.max_num_batched_tokens, self.budget_target)) - len(plan.decode)
++        tilt_budget_scale = 1.20 if self.tilt == "TTFT-first" else (0.65 if self.tilt == "TPOT-first" else 1.0)
++        tilt_chunk_scale = 1.25 if self.tilt == "TTFT-first" else (0.60 if self.tilt == "TPOT-first" else 1.0)
++        effective_budget = min(cfg.max_num_batched_tokens,
++                               int(self.budget_target * tilt_budget_scale))
++        effective_chunk = max(self.chunk_min, min(self.chunk_max,
++                              int(self.chunk_target * tilt_chunk_scale)))
++        budget = effective_budget - len(plan.decode)
+@@ -558,1 +604,1 @@
+-                r.chunk_quota = int(self.chunk_target)      # frozen for this iteration
++                r.chunk_quota = effective_chunk      # frozen for this iteration
