@@ -9,7 +9,7 @@
 - 720 paired main-matrix runs: 6 workloads × 4 load points × 3 seeds × 10 policies.
 - 87 additional runs: SLOA ablation, fixed-chunk sweep, risk-threshold × gamma sweep.
 - 221 corrected profiling grid points (46 decode / 60 prefill / 115 mixed), 19,890 synthetic profiling samples.
-- 6 unit tests pass.
+- 6 regression tests pass in the complete working package.
 
 | Policy | Macro Goodput (req/s) | TTFT P99 (ms) | TPOT P99 (ms) |
 |---|---:|---:|---:|
@@ -26,21 +26,21 @@ The paired 95% bootstrap intervals for SLOA-V2 vs V1-emulated and SLOWEAVE inclu
 - [V3.0 SLOA-MPC design proposal](V3_DESIGN.md)
 - [V2.0 task checklist](V2.0_TODO.md)
 - [V2.0 change log](V2.0_CHANGELOG.md)
-- [Historical V1 README](README_V1_HISTORICAL.md)
 
-## Repository structure
+## Repository contents
 
-- `src/`: cost model, engine, predictors, schedulers and workload generator.
 - `scripts/09_v2_followup.py`: V2.0 paired experiment runner.
 - `scripts/10_finalize_v2.py`: aggregation, paired bootstrap and figure generation.
-- `scripts/run_v2_matrix.sh`: reproducible W1–W6 experiment matrix and ablations.
-- `tests/`: V2.0 regression tests.
-- `data/profile/`: corrected profiling grid and sample outputs.
-- `data/reference_bundle/`: reference profiling source bundle.
-- `results/v2_followup/`: raw run-level CSVs, summaries and figures.
-- `patches/`: source patches relative to original V1 package.
+- `scripts/run_v2_matrix.sh`: reproducible W1–W6 matrix and ablation runner.
+- `tests/test_v2_feedback.py`: V2.0 regression tests.
+- `patches/V2.0_core.patch`: core source changes relative to the original V1 source tree.
+- `results/v2_followup/`: macro summary CSVs, paired confidence intervals, rho audit and ablation/chunk/parameter summaries.
 
-## Reproduce
+**Source-tree note:** this GitHub repository was initially empty. It now contains the V2.0 patch, experiment harness, tests, reports and result summaries; it does not yet mirror every unchanged V1 source module or the full raw run-level dataset. The complete working source tree, raw CSVs, figures and reference materials are included in the accompanying project ZIP provided in this conversation.
+
+## Reproduce from the complete project bundle
+
+After extracting the complete project ZIP (which contains the V1 base source plus V2.0 modifications):
 
 ```bash
 pip install -r requirements.txt
@@ -50,7 +50,7 @@ bash scripts/run_v2_matrix.sh
 python scripts/10_finalize_v2.py
 ```
 
-W7-Adversarial is an optional stress test: 40k-token whales and long outputs make it expensive, and a small trace makes P99 estimates less stable.
+W7-Adversarial is an optional stress test: 40k-token whales and long outputs make it expensive, and small traces make P99 estimates less stable.
 
 ## Main findings motivating V3
 
